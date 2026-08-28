@@ -179,7 +179,7 @@ func FilterTitle(_ State, val value.Value, _ []value.Value, _ map[string]value.V
 		var result strings.Builder
 		capitalizeNext := true
 		for _, r := range s {
-			if unicode.IsSpace(r) || r == '-' || r == '_' || r == ':' || r == ',' || r == '.' {
+			if unicode.IsSpace(r) || r == '-' || r == '(' || r == '{' || r == '[' || r == '<' {
 				capitalizeNext = true
 				result.WriteRune(r)
 			} else if capitalizeNext {

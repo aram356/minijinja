@@ -221,6 +221,10 @@ mod builtins {
 
     /// Converts a value to title case.
     ///
+    /// Words are started by whitespace or one of `-`, `(`, `{`, `[` and `<`.
+    /// Other punctuation such as `'`, `.` or `_` does not start a new word,
+    /// so `don't` becomes `Don't` rather than `Don'T`.
+    ///
     /// ```jinja
     /// <h1>{{ chapter.title|title }}</h1>
     /// ```
@@ -229,7 +233,7 @@ mod builtins {
         let mut rv = String::new();
         let mut capitalize = true;
         for c in v.chars() {
-            if c.is_ascii_punctuation() || c.is_whitespace() {
+            if matches!(c, '-' | '(' | '{' | '[' | '<') || c.is_whitespace() {
                 rv.push(c);
                 capitalize = true;
             } else if capitalize {

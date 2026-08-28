@@ -1516,3 +1516,28 @@ func TestOneShotIteratorString(t *testing.T) {
 		t.Errorf("expected '<iterator>', got %q", result)
 	}
 }
+
+func TestTitleFilterWordBoundaries(t *testing.T) {
+	// Word boundaries follow Jinja2: whitespace and one of - ( { [ <
+	cases := []struct{ input, expected string }{
+		{"hello world", "Hello World"},
+		{"don't stop believing", "Don't Stop Believing"},
+		{"foo_bar.baz", "Foo_bar.baz"},
+		{"the bIrd, is The:word", "The Bird, Is The:word"},
+		{"foo (bar) [baz] {qux} <quux>", "Foo (Bar) [Baz] {Qux} <Quux>"},
+		{"foo-bar", "Foo-Bar"},
+	}
+	for _, c := range cases {
+		tmpl, err := NewEnvironment().TemplateFromString(`{{ x|title }}`)
+		if err != nil {
+			t.Fatal(err)
+		}
+		result, err := tmpl.Render(map[string]any{"x": c.input})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if result != c.expected {
+			t.Errorf("title(%q) = %q, want %q", c.input, result, c.expected)
+		}
+	}
+}
