@@ -5,6 +5,7 @@ All notable changes to MiniJinja are documented here.
 ## Unreleased
 
 * Switched `minijinja-contrib` date and time filters from `time`/`time-tz` to Jiff. Custom formats now use `strftime`-style syntax instead of `time` format descriptions.  #694
+* Fixed the `title` filter treating every ASCII punctuation character as a word boundary in Rust and Go. Words now start after whitespace or one of `-`, `(`, `{`, `[` and `<` as in Jinja2, so `"don't"|title` renders as `Don't` instead of `Don'T`.
 
 ## 3.0.0-alpha.0
 
