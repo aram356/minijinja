@@ -247,7 +247,7 @@ fn eval_binop(op: BinOpKind, left: &Value, right: &Value) -> Option<Value> {
         BinOpKind::FloorDiv => ops::int_div(left, right).ok(),
         BinOpKind::Rem => ops::rem(left, right).ok(),
         BinOpKind::Pow => ops::pow(left, right).ok(),
-        BinOpKind::Concat => Some(ops::string_concat(left.clone(), right)),
+        BinOpKind::Concat => ops::string_concat(left.clone(), right).ok(),
         BinOpKind::Eq => Some(Value::from(left == right)),
         BinOpKind::Ne => Some(Value::from(left != right)),
         BinOpKind::Lt => Some(Value::from(left < right)),

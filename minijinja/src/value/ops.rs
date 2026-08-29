@@ -468,8 +468,20 @@ pub fn neg(val: &Value) -> Result<Value, Error> {
 }
 
 /// Attempts a string concatenation.
-pub fn string_concat(left: Value, right: &Value) -> Value {
-    Value::from(format!("{left}{right}"))
+pub fn string_concat(left: Value, right: &Value) -> Result<Value, Error> {
+    // Reject before allocating when the operands' string lengths would sum
+    // past the cap, mirroring the guard on `add`.  Non-string operands render
+    // to a bounded length (so they contribute 0 here); the exponential vector
+    // is `ns.s ~ ns.s` where both operands are the same growing string.
+    let left_len = left.as_str().map_or(0, str::len);
+    let right_len = right.as_str().map_or(0, str::len);
+    if left_len.saturating_add(right_len) > MAX_REPEATED_STRING_LEN {
+        return Err(Error::new(
+            ErrorKind::InvalidOperation,
+            "concatenated string is too large",
+        ));
+    }
+    Ok(Value::from(format!("{left}{right}")))
 }
 
 /// Implements a containment operation on values.
@@ -736,12 +748,22 @@ mod tests {
     #[test]
     fn test_concat() {
         assert_eq!(
-            string_concat(Value::from("foo"), &Value::from(42)),
+            string_concat(Value::from("foo"), &Value::from(42)).unwrap(),
             Value::from("foo42")
         );
         assert_eq!(
-            string_concat(Value::from(23), &Value::from(42)),
+            string_concat(Value::from(23), &Value::from(42)).unwrap(),
             Value::from("2342")
+        );
+
+        // The `~` builder rejects before allocating when the operands' lengths
+        // would sum past the cap.  One ~50MB Arc-backed string (cheap to clone)
+        // is added to itself, so the ~100MB result is never materialized.
+        let big = Value::from("x".repeat(MAX_REPEATED_STRING_LEN / 2 + 1));
+        let err = string_concat(big.clone(), &big).unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            "invalid operation: concatenated string is too large"
         );
     }
 

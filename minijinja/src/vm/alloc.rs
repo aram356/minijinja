@@ -79,6 +79,27 @@ mod tests {
     }
 
     #[test]
+    fn test_alloc_budget_bounds_tilde_concat() {
+        // `~` is Jinja2's idiomatic string-concat operator and self-doubles
+        // exactly like `+`, so the budget must bound it the same way.
+        let mut env = Environment::new();
+        env.set_max_intermediate_size(Some(1_000_000));
+        let err = env
+            .render_str(
+                "{% set ns = namespace(s='x') %}\
+                 {% for i in range(40) %}{% set ns.s = ns.s ~ ns.s %}{% endfor %}{{ 'ok' }}",
+                (),
+            )
+            .unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::InvalidOperation);
+        assert!(
+            err.to_string()
+                .contains("template allocation budget exceeded"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
     fn test_alloc_budget_bounds_many_distinct_strings() {
         // The cumulative budget also bounds many distinct large strings (here
         // via `*`), not just a single self-doubling accumulator.  `n` is a

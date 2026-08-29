@@ -488,7 +488,11 @@ impl<'env> Vm<'env> {
                     b = stack.pop();
                     ctx_ok!(undefined_behavior.assert_value_not_undefined(&b));
                     ctx_ok!(undefined_behavior.assert_value_not_undefined(&a));
-                    stack.push(ops::string_concat(b, &a));
+                    let rv = ctx_ok!(ops::string_concat(b, &a));
+                    if let Some(ref tracker) = state.alloc_tracker {
+                        ctx_ok!(charge_alloc(tracker, &rv));
+                    }
+                    stack.push(rv);
                 }
                 Instruction::In => {
                     a = stack.pop();
