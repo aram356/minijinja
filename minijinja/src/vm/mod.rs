@@ -317,6 +317,19 @@ impl<'env> Vm<'env> {
                 }};
             }
 
+            // Charges the per-render allocation budget for a value about to be
+            // pushed onto the stack, if it is a newly-constructed string.  Used
+            // by every arm that can produce a string (operators, filters,
+            // function/method/object calls, and captures) so the budget is a
+            // complete bound on evaluation-produced intermediate strings.
+            macro_rules! charge_str {
+                ($rv:expr) => {{
+                    if let Some(ref tracker) = state.alloc_tracker {
+                        ctx_ok!(charge_alloc(tracker, &$rv));
+                    }
+                }};
+            }
+
             // if the fuel consumption feature is enabled, track the fuel
             // consumption here.
             #[cfg(feature = "fuel")]
@@ -454,9 +467,7 @@ impl<'env> Vm<'env> {
                     b = stack.pop();
                     a = stack.pop();
                     let rv = ctx_ok!(ops::add(&a, &b));
-                    if let Some(ref tracker) = state.alloc_tracker {
-                        ctx_ok!(charge_alloc(tracker, &rv));
-                    }
+                    charge_str!(rv);
                     stack.push(rv);
                 }
                 Instruction::Sub => func_binop!(sub),
@@ -464,9 +475,7 @@ impl<'env> Vm<'env> {
                     b = stack.pop();
                     a = stack.pop();
                     let rv = ctx_ok!(ops::mul(&a, &b));
-                    if let Some(ref tracker) = state.alloc_tracker {
-                        ctx_ok!(charge_alloc(tracker, &rv));
-                    }
+                    charge_str!(rv);
                     stack.push(rv);
                 }
                 Instruction::Div => func_binop!(div),
@@ -489,9 +498,7 @@ impl<'env> Vm<'env> {
                     ctx_ok!(undefined_behavior.assert_value_not_undefined(&b));
                     ctx_ok!(undefined_behavior.assert_value_not_undefined(&a));
                     let rv = ctx_ok!(ops::string_concat(b, &a));
-                    if let Some(ref tracker) = state.alloc_tracker {
-                        ctx_ok!(charge_alloc(tracker, &rv));
-                    }
+                    charge_str!(rv);
                     stack.push(rv);
                 }
                 Instruction::In => {
@@ -566,7 +573,9 @@ impl<'env> Vm<'env> {
                     if let Some((target, end_capture)) = l.current_recursion_jump.take() {
                         pc = target;
                         if end_capture {
-                            stack.push(out.end_capture(state.auto_escape.get()));
+                            let rv = out.end_capture(state.auto_escape.get());
+                            charge_str!(rv);
+                            stack.push(rv);
                         }
                         continue;
                     }
@@ -635,7 +644,9 @@ impl<'env> Vm<'env> {
                     out.begin_capture(*mode);
                 }
                 Instruction::EndCapture => {
-                    stack.push(out.end_capture(state.auto_escape.get()));
+                    let rv = out.end_capture(state.auto_escape.get());
+                    charge_str!(rv);
+                    stack.push(rv);
                 }
                 Instruction::ApplyFilter(name, arg_count, local_id) => {
                     let normalized_name = normalize_filter_test_name(name);
@@ -653,6 +664,7 @@ impl<'env> Vm<'env> {
                     let arg_count = args.len();
                     a = ctx_ok!(filter.call(state, args));
                     stack.drop_top(arg_count);
+                    charge_str!(a);
                     stack.push(a);
                 }
                 Instruction::PerformTest(name, arg_count, local_id) => {
@@ -706,6 +718,7 @@ impl<'env> Vm<'env> {
                     };
                     let arg_count = args.len();
                     stack.drop_top(arg_count);
+                    charge_str!(rv);
                     stack.push(rv);
                 }
                 Instruction::CallMethod(name, arg_count) => {
@@ -713,6 +726,7 @@ impl<'env> Vm<'env> {
                     let arg_count = args.len();
                     a = ctx_ok!(args[0].call_method(state, name, &args[1..]));
                     stack.drop_top(arg_count);
+                    charge_str!(a);
                     stack.push(a);
                 }
                 Instruction::CallObject(arg_count) => {
@@ -720,6 +734,7 @@ impl<'env> Vm<'env> {
                     let arg_count = args.len();
                     a = ctx_ok!(args[0].call(state, &args[1..]));
                     stack.drop_top(arg_count);
+                    charge_str!(a);
                     stack.push(a);
                 }
                 Instruction::DupTop => {

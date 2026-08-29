@@ -99,6 +99,64 @@ mod tests {
         );
     }
 
+    // Renders `src` with a 1MB budget and asserts the render fails specifically
+    // because the intermediate-allocation budget was exceeded (not an OOM).
+    fn assert_budget_trips(src: &str) {
+        let mut env = Environment::new();
+        env.set_max_intermediate_size(Some(1_000_000));
+        let err = env.render_str(src, ()).unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::InvalidOperation);
+        assert!(
+            err.to_string()
+                .contains("template allocation budget exceeded"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn test_alloc_budget_bounds_replace_filter() {
+        // The `replace` filter grows super-linearly (`a` -> `aa` doubles the
+        // count of `a`s), so filter results must be charged at the ApplyFilter
+        // arm.  Bounded now that they are.
+        assert_budget_trips(
+            "{% set ns = namespace(s='a') %}\
+             {% for i in range(40) %}{% set ns.s = ns.s | replace('a', 'aa') %}{% endfor %}{{ 'ok' }}",
+        );
+    }
+
+    #[test]
+    fn test_alloc_budget_bounds_format_filter() {
+        // The `format` filter with repeated `%s` doubles per iteration; charged
+        // at the ApplyFilter arm.
+        assert_budget_trips(
+            "{% set ns = namespace(s='a') %}\
+             {% for i in range(40) %}{% set ns.s = '%s%s' | format(ns.s, ns.s) %}{% endfor %}{{ 'ok' }}",
+        );
+    }
+
+    #[test]
+    fn test_alloc_budget_bounds_block_set_capture() {
+        // A block `{% set %}` captures emitted output into a string (EndCapture);
+        // referencing the accumulator twice doubles it each iteration.  Charged
+        // at the EndCapture arm.
+        assert_budget_trips(
+            "{% set ns = namespace(s='x') %}\
+             {% for i in range(40) %}{% set ns.s %}{{ ns.s }}{{ ns.s }}{% endset %}{% endfor %}{{ 'ok' }}",
+        );
+    }
+
+    #[test]
+    fn test_alloc_budget_bounds_macro_call() {
+        // A macro returns its rendered output as a string (pushed by the
+        // CallFunction arm); a doubling macro applied to the accumulator grows
+        // exponentially.  Charged now.
+        assert_budget_trips(
+            "{% macro dup(s) %}{{ s }}{{ s }}{% endmacro %}\
+             {% set ns = namespace(s='x') %}\
+             {% for i in range(40) %}{% set ns.s = dup(ns.s) %}{% endfor %}{{ 'ok' }}",
+        );
+    }
+
     #[test]
     fn test_alloc_budget_bounds_many_distinct_strings() {
         // The cumulative budget also bounds many distinct large strings (here
