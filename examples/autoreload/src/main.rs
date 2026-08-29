@@ -34,7 +34,7 @@ fn main() {
 
     // keep running the template.  to experiment change the template.txt file or
     // rename or change the include file.
-    for iteration in 1.. {
+    for iteration in 1..=u64::MAX {
         // acquire gets the latest version of the environment.
         let env = reloader.acquire_env().unwrap();
         let tmpl = env.get_template("template.txt").unwrap();
