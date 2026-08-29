@@ -82,6 +82,7 @@ pub struct Environment<'source> {
     debug: bool,
     #[cfg(feature = "fuel")]
     fuel: Option<u64>,
+    max_intermediate_size: Option<usize>,
     recursion_limit: usize,
 }
 
@@ -133,6 +134,7 @@ impl<'source> Environment<'source> {
             debug: cfg!(debug_assertions),
             #[cfg(feature = "fuel")]
             fuel: None,
+            max_intermediate_size: None,
             recursion_limit: MAX_RECURSION,
         }
     }
@@ -156,6 +158,7 @@ impl<'source> Environment<'source> {
             debug: cfg!(debug_assertions),
             #[cfg(feature = "fuel")]
             fuel: None,
+            max_intermediate_size: None,
             recursion_limit: MAX_RECURSION,
         }
     }
@@ -619,6 +622,31 @@ impl<'source> Environment<'source> {
     #[cfg_attr(docsrs, doc(cfg(feature = "fuel")))]
     pub fn fuel(&self) -> Option<u64> {
         self.fuel
+    }
+
+    /// Sets the maximum cumulative intermediate allocation for a single render.
+    ///
+    /// This bounds the total number of bytes of intermediate strings that a
+    /// single render may allocate through the string-producing operators (`+`
+    /// and `*`).  Once the running total during a render exceeds the configured
+    /// size, rendering fails with an
+    /// [`InvalidOperation`](crate::ErrorKind::InvalidOperation) error instead of
+    /// continuing to allocate.  A value of `0` or `None` (the default) disables
+    /// the limit.
+    ///
+    /// This is primarily intended as a safeguard when rendering untrusted
+    /// templates, which can otherwise exhaust memory through repeated string
+    /// concatenation such as `{% set s = s + s %}` inside a loop.
+    pub fn set_max_intermediate_size(&mut self, size: Option<usize>) {
+        self.max_intermediate_size = size;
+    }
+
+    /// Returns the configured maximum cumulative intermediate allocation size.
+    ///
+    /// See [`set_max_intermediate_size`](Self::set_max_intermediate_size) for
+    /// details.  `None` means the limit is disabled.
+    pub fn max_intermediate_size(&self) -> Option<usize> {
+        self.max_intermediate_size
     }
 
     /// Sets the syntax for the environment.

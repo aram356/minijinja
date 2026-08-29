@@ -26,6 +26,7 @@ use crate::vm::closure_object::Closure;
 pub(crate) use crate::vm::context::Context;
 pub use crate::vm::state::State;
 
+mod alloc;
 #[cfg(feature = "macros")]
 mod closure_object;
 mod context;
@@ -37,6 +38,8 @@ mod macro_object;
 #[cfg(feature = "multi_template")]
 mod module_object;
 mod state;
+
+use self::alloc::AllocTracker;
 
 // the cost of a single include against the stack limit.
 #[cfg(feature = "multi_template")]
@@ -149,6 +152,7 @@ impl<'env> Vm<'env> {
                 closure_tracker: state.closure_tracker.clone(),
                 #[cfg(feature = "fuel")]
                 fuel_tracker: state.fuel_tracker.clone(),
+                alloc_tracker: state.alloc_tracker.clone(),
             },
             out,
             Stack::from(args),
@@ -446,9 +450,25 @@ impl<'env> Vm<'env> {
                     }
                     stack.push(Value::from(len));
                 }
-                Instruction::Add => func_binop!(add),
+                Instruction::Add => {
+                    b = stack.pop();
+                    a = stack.pop();
+                    let rv = ctx_ok!(ops::add(&a, &b));
+                    if let Some(ref tracker) = state.alloc_tracker {
+                        ctx_ok!(charge_alloc(tracker, &rv));
+                    }
+                    stack.push(rv);
+                }
                 Instruction::Sub => func_binop!(sub),
-                Instruction::Mul => func_binop!(mul),
+                Instruction::Mul => {
+                    b = stack.pop();
+                    a = stack.pop();
+                    let rv = ctx_ok!(ops::mul(&a, &b));
+                    if let Some(ref tracker) = state.alloc_tracker {
+                        ctx_ok!(charge_alloc(tracker, &rv));
+                    }
+                    stack.push(rv);
+                }
                 Instruction::Div => func_binop!(div),
                 Instruction::IntDiv => func_binop!(int_div),
                 Instruction::Rem => func_binop!(rem),
@@ -1134,6 +1154,16 @@ impl<'env> Vm<'env> {
             closure,
             caller_reference: (flags & MACRO_CALLER) != 0,
         }));
+    }
+}
+
+/// Charges the render's allocation budget for a string produced by an
+/// arithmetic instruction.  Only the string-producing operators (`+`, `*`) can
+/// grow intermediate allocations without bound, so non-string results are free.
+fn charge_alloc(tracker: &AllocTracker, rv: &Value) -> Result<(), Error> {
+    match rv.as_str().map(str::len) {
+        Some(len) => tracker.charge(len),
+        None => Ok(()),
     }
 }
 

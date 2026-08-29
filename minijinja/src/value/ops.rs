@@ -311,7 +311,15 @@ pub fn add(lhs: &Value, rhs: &Value) -> Result<Value, Error> {
             .ok_or_else(|| failed_op("+", lhs, rhs))
             .map(int_as_value),
         Some(CoerceResult::F64(a, b)) => Ok((a + b).into()),
-        Some(CoerceResult::Str(a, b)) => Ok(Value::from([a, b].concat())),
+        Some(CoerceResult::Str(a, b)) => {
+            if a.len().saturating_add(b.len()) > MAX_REPEATED_STRING_LEN {
+                return Err(Error::new(
+                    ErrorKind::InvalidOperation,
+                    "concatenated string is too large",
+                ));
+            }
+            Ok(Value::from([a, b].concat()))
+        }
         _ => Err(impossible_op("+", lhs, rhs)),
     }
 }
@@ -518,6 +526,26 @@ mod tests {
         assert_eq!(
             err.to_string(),
             "invalid operation: repeated string is too large"
+        );
+    }
+
+    #[test]
+    fn test_string_concat_size_limit() {
+        // `+` on strings must reject before allocating when the concatenated
+        // length would exceed the same cap that `*` already enforces.  Adding a
+        // single ~50MB string to itself keeps the test modest: the length guard
+        // trips and the ~100MB result is never materialized.
+        let big = Value::from("x".repeat(MAX_REPEATED_STRING_LEN / 2 + 1));
+        let err = add(&big, &big).unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            "invalid operation: concatenated string is too large"
+        );
+
+        // Concatenations at or below the cap still succeed.
+        assert_eq!(
+            add(&Value::from("foo"), &Value::from("bar")).unwrap(),
+            Value::from("foobar")
         );
     }
 

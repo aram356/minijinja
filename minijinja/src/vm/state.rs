@@ -13,6 +13,7 @@ use crate::utils::{AutoEscape, UndefinedBehavior};
 use crate::value::{ArgType, Object, Value};
 use crate::vm::context::Context;
 
+use crate::vm::alloc::AllocTracker;
 #[cfg(feature = "fuel")]
 use crate::vm::fuel::FuelTracker;
 
@@ -58,6 +59,7 @@ pub struct State<'template, 'env> {
     pub(crate) closure_tracker: std::sync::Arc<crate::vm::closure_object::ClosureTracker>,
     #[cfg(feature = "fuel")]
     pub(crate) fuel_tracker: Option<std::sync::Arc<FuelTracker>>,
+    pub(crate) alloc_tracker: Option<Arc<AllocTracker>>,
 }
 
 impl fmt::Debug for State<'_, '_> {
@@ -95,6 +97,7 @@ impl<'template, 'env> State<'template, 'env> {
             closure_tracker: Default::default(),
             #[cfg(feature = "fuel")]
             fuel_tracker: ctx.env().fuel().map(FuelTracker::new),
+            alloc_tracker: ctx.env().max_intermediate_size().map(AllocTracker::new),
             ctx,
         }
     }
