@@ -5,6 +5,12 @@ use crate::value::{DynObject, ObjectRepr, Value, ValueKind, ValueRepr};
 const MIN_I128_AS_POS_U128: u128 = 170141183460469231731687303715884105728;
 const MAX_REPEATED_STRING_LEN: usize = 100_000_000;
 
+/// Largest element count a repeated sequence (`seq * n`) may claim.
+///
+/// The repeat is lazy, so this bounds what a later `join` or iteration can be
+/// asked to materialize, not what the repeat itself allocates.
+const MAX_REPEATED_SEQ_LEN: usize = 100_000_000;
+
 /// Iterator wrapper that provides exact size hints for iterators with known length.
 pub(crate) struct LenIterWrap<I: Send + Sync>(pub(crate) usize, pub(crate) I);
 
@@ -379,6 +385,17 @@ fn repeat_iterable(n: &Value, seq: &DynObject) -> Result<Value, Error> {
             "cannot repeat unsized iterables",
         )
     }));
+
+    // The repeat itself is lazy, but its length is known now, and everything
+    // that later materializes it (`join`, `pprint`, iteration) pays for the
+    // whole thing.  Reject a repeat that could never be materialized rather
+    // than deferring the failure to whichever site consumes it.
+    if !matches!(len.checked_mul(n), Some(total) if total <= MAX_REPEATED_SEQ_LEN) {
+        return Err(Error::new(
+            ErrorKind::InvalidOperation,
+            "repeated sequence is too large",
+        ));
+    }
 
     // This is not optimal.  We only query the enumerator for the length once
     // but we support repeated iteration.  We could both lie about our length

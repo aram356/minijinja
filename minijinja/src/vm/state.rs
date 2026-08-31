@@ -156,6 +156,36 @@ impl<'template, 'env> State<'template, 'env> {
         self.current_block
     }
 
+    /// Checks `bytes` against the render's remaining allocation budget.
+    ///
+    /// Filters and functions that are about to allocate an output whose size
+    /// they can compute (or observe as it grows) call this BEFORE allocating,
+    /// so a single operation cannot expand its input past the budget in one
+    /// step.  It never charges: the VM still charges the finished result, so a
+    /// checked site is accounted exactly once.  When no budget is configured
+    /// (the default) this is a no-op.
+    ///
+    /// See [`Environment::set_max_intermediate_size`](crate::Environment::set_max_intermediate_size).
+    // Consulted by the builtin filters, which can be compiled out.
+    #[allow(dead_code)]
+    #[inline]
+    pub(crate) fn alloc_check(&self, bytes: usize) -> Result<(), Error> {
+        match self.alloc_tracker {
+            Some(ref tracker) => tracker.check(bytes),
+            None => Ok(()),
+        }
+    }
+
+    /// Returns a callback that forwards to [`alloc_check`](Self::alloc_check).
+    ///
+    /// Helper for the size-checked formatting helpers, which are shared with
+    /// call paths that have no `State` and so cannot take one directly.
+    #[allow(dead_code)]
+    #[inline]
+    pub(crate) fn alloc_checker(&self) -> impl Fn(usize) -> Result<(), Error> + '_ {
+        move |bytes| self.alloc_check(bytes)
+    }
+
     /// Looks up a variable by name in the context.
     ///
     /// # Note on Closures

@@ -157,24 +157,30 @@ pub fn escape(state: &State, v: &Value) -> Result<Value, Error> {
         },
         other => other,
     };
-    let mut rv = match v.as_str() {
-        Some(s) => String::with_capacity(s.len()),
-        None => String::new(),
-    };
-    let mut out = Output::new(&mut rv);
-    if matches!(auto_escape, AutoEscape::Custom(_)) {
+    // Escaping expands its input by a small but real factor (`&amp;` and
+    // friends turn one byte into up to six), so a string that legitimately fits
+    // the budget can escape to several times it.  The expansion is data
+    // dependent rather than computable, so the output is checked as it is
+    // written rather than up front.
+    let check = state.alloc_checker();
+    let mut writer =
+        crate::vm::alloc::BudgetWriter::with_capacity(v.as_str().map_or(0, str::len), &check);
+    let mut out = Output::new(&mut writer);
+    let rv = if matches!(auto_escape, AutoEscape::Custom(_)) {
         // The formatter reads the escape mode from state, so temporarily
         // override it to ensure |e honors the computed escape mode even when
         // auto-escape is disabled in the current scope. The default formatter
         // also errors on custom auto-escape formats, so we must route through
         // the environment formatter here.
-        ok!(state.with_auto_escape(auto_escape, |state| {
-            state.env().format(v, state, &mut out)
-        }));
+        state.with_auto_escape(auto_escape, |state| state.env().format(v, state, &mut out))
     } else {
-        ok!(write_escaped(&mut out, auto_escape, v));
+        write_escaped(&mut out, auto_escape, v)
+    };
+    drop(out);
+    if let Err(err) = rv {
+        return Err(writer.take_err(err));
     }
-    Ok(Value::from_safe_string(rv))
+    Ok(Value::from_safe_string(writer.into_string()))
 }
 
 #[cfg(feature = "builtins")]
@@ -182,13 +188,16 @@ mod builtins {
     use super::*;
 
     use crate::error::ErrorKind;
-    use crate::format_utils::{format_filter, format_printf_with, FormatConversion, FormatStyle};
+    use crate::format_utils::{
+        format_filter_checked, format_printf_with, FormatConversion, FormatStyle,
+    };
     use crate::utils::{safe_sort, splitn_whitespace};
     use crate::value::merge_object::{MergeDict, MergeSeq};
     use crate::value::ops::{self, as_f64, LenIterWrap};
     use crate::value::{
         Enumerator, Kwargs, Object, ObjectRepr, Rest, StringInput, ValueKind, ValueRepr,
     };
+    use crate::vm::alloc::{BudgetWriter, SizeCheck, CONTAINER_ELEMENT_COST};
     use std::borrow::Cow;
     use std::cmp::Ordering;
     use std::fmt::Write;
@@ -277,15 +286,36 @@ mod builtins {
             && (value.is_safe() || from.is_safe() || to.is_safe());
 
         if safety_aware {
-            let output = value
-                .format(state)?
-                .replace(from.as_str(), &to.format(state)?);
-            Ok(Value::from_safe_string(output))
+            let input = ok!(value.format(state));
+            let to = ok!(to.format(state));
+            ok!(state.alloc_check(replace_output_len(&input, from.as_str(), &to)));
+            Ok(Value::from_safe_string(input.replace(from.as_str(), &to)))
         } else {
-            Ok(Value::from(
-                value.as_str().replace(from.as_str(), to.as_str()),
-            ))
+            let input = value.as_str();
+            ok!(state.alloc_check(replace_output_len(input, from.as_str(), to.as_str())));
+            Ok(Value::from(input.replace(from.as_str(), to.as_str())))
         }
+    }
+
+    /// The exact byte length `str::replace` will produce for these operands.
+    ///
+    /// `replace` expands its input by `to.len() / from.len()`, a ratio the
+    /// caller controls on both sides, so it is the sharpest single-operation
+    /// amplifier in the filter set: a 128 KiB input and a 64 KiB replacement ask
+    /// for roughly 8 GiB.  The size is exactly computable up front, so it is
+    /// checked against the budget before anything is allocated.
+    fn replace_output_len(input: &str, from: &str, to: &str) -> usize {
+        let matches = if from.is_empty() {
+            // An empty pattern matches at every char boundary and once more at
+            // the end, so `to` is inserted `chars + 1` times.
+            input.chars().count().saturating_add(1)
+        } else {
+            input.matches(from).count()
+        };
+        input
+            .len()
+            .saturating_add(matches.saturating_mul(to.len()))
+            .saturating_sub(matches.saturating_mul(from.len()))
     }
 
     /// Returns the "length" of the value
@@ -467,7 +497,16 @@ mod builtins {
         value: &Value,
         joiner: Option<StringInput<'_>>,
     ) -> Result<Value, Error> {
-        fn join_plain(iter: impl Iterator<Item = Value>, joiner: &str) -> String {
+        // `join` materializes its iterable in full, and that iterable can be a
+        // lazily repeated sequence (`[x] * n`), whose size is bounded by nothing
+        // until it is joined.  There is no size to compute up front, so the
+        // accumulating output is checked against the budget as it grows and the
+        // join aborts partway instead of finishing an oversized string.
+        fn join_plain(
+            iter: impl Iterator<Item = Value>,
+            joiner: &str,
+            check: SizeCheck<'_>,
+        ) -> Result<String, Error> {
             let mut output = String::new();
             for (idx, item) in iter.enumerate() {
                 if idx > 0 {
@@ -478,14 +517,16 @@ mod builtins {
                 } else {
                     write!(output, "{item}").ok();
                 }
+                ok!(check(output.len()));
             }
-            output
+            Ok(output)
         }
 
         fn join_safe(
             state: &State,
             iter: impl Iterator<Item = Value>,
             joiner: &str,
+            check: SizeCheck<'_>,
         ) -> Result<String, Error> {
             let mut output = String::new();
             for (idx, item) in iter.enumerate() {
@@ -497,6 +538,7 @@ mod builtins {
                 } else {
                     output.push_str(&ok!(state.format(item)));
                 }
+                ok!(check(output.len()));
             }
             Ok(output)
         }
@@ -510,13 +552,15 @@ mod builtins {
             .with_source(err)
         }));
 
+        let check = state.alloc_checker();
+
         if matches!(state.auto_escape(), AutoEscape::None) {
-            return Ok(Value::from(join_plain(iter, joiner_str)));
+            return Ok(Value::from(ok!(join_plain(iter, joiner_str, &check))));
         }
 
         if joiner.as_ref().is_some_and(StringInput::is_safe) {
             return Ok(Value::from_safe_string(ok!(join_safe(
-                state, iter, joiner_str
+                state, iter, joiner_str, &check
             ))));
         }
 
@@ -531,10 +575,15 @@ mod builtins {
             Ok(Value::from_safe_string(ok!(join_safe(
                 state,
                 items.into_iter(),
-                &joiner
+                &joiner,
+                &check
             ))))
         } else {
-            Ok(Value::from(join_plain(items.into_iter(), joiner_str)))
+            Ok(Value::from(ok!(join_plain(
+                items.into_iter(),
+                joiner_str,
+                &check
+            ))))
         }
     }
 
@@ -1023,6 +1072,10 @@ mod builtins {
         if count == 0 {
             return Err(Error::new(ErrorKind::InvalidOperation, "count cannot be 0"));
         }
+        // `count` is caller-controlled and reserves one slot per slice, so a
+        // single call can ask for an arbitrarily large allocation from a
+        // one-element input.  Check the reservation before making it.
+        ok!(state.alloc_check(count.saturating_mul(CONTAINER_ELEMENT_COST)));
         let items = ok!(state.undefined_behavior().try_iter(value)).collect::<Vec<_>>();
         let len = items.len();
         let items_per_slice = len / count;
@@ -1080,6 +1133,9 @@ mod builtins {
         if count == 0 {
             return Err(Error::new(ErrorKind::InvalidOperation, "count cannot be 0"));
         }
+        // As with `slice`, `count` sizes a reservation directly, and the
+        // fill_with path below pushes `count` items regardless of the input.
+        ok!(state.alloc_check(count.saturating_mul(CONTAINER_ELEMENT_COST)));
         let mut rv = Vec::with_capacity(value.len().unwrap_or(0) / count);
         let mut tmp = Vec::with_capacity(count);
 
@@ -1200,6 +1256,7 @@ mod builtins {
     /// ```
     #[cfg_attr(docsrs, doc(cfg(all(feature = "builtins"))))]
     pub fn indent(
+        state: &State,
         value: StringInput<'_>,
         width: Option<usize>,
         indent_first_line: Option<bool>,
@@ -1230,7 +1287,18 @@ mod builtins {
         };
         ok!(kwargs.assert_all_used());
 
+        // `width` is caller-controlled and is materialized as a run of spaces,
+        // once for the prefix and again for every line, so both the prefix and
+        // the whole output are checked before either is built.
+        ok!(state.alloc_check(width));
         let input = strip_trailing_newline(value.as_str());
+        // The prefix and the output are live at the same time, so check what
+        // both cost together rather than each on its own.
+        ok!(state.alloc_check(
+            width
+                .saturating_add(input.len())
+                .saturating_add(width.saturating_mul(input.split('\n').count()))
+        ));
         let indent_with = " ".repeat(width);
         let mut output = String::new();
         let mut iterator = input.split('\n');
@@ -1494,12 +1562,22 @@ mod builtins {
             .env()
             .get_filter(filter_name)
             .ok_or_else(|| Error::from(ErrorKind::UnknownFilter)));
+        // Every element is filtered inside this one call, so a growth filter
+        // applied through `map` expands the whole sequence before the evaluator
+        // sees a single result.  Nothing here is charged yet, so the running
+        // total is checked as the results accumulate.
+        let mut produced = 0usize;
         for value in ok!(state.undefined_behavior().try_iter(value)) {
             let new_args = Some(value.clone())
                 .into_iter()
                 .chain(args.iter().skip(1).cloned())
                 .collect::<Vec<_>>();
-            rv.push(ok!(filter.call(state, &new_args)));
+            let mapped = ok!(filter.call(state, &new_args));
+            produced = produced
+                .saturating_add(CONTAINER_ELEMENT_COST)
+                .saturating_add(mapped.as_str().map_or(0, str::len));
+            ok!(state.alloc_check(produced));
+            rv.push(mapped);
         }
         Ok(rv)
     }
@@ -1814,8 +1892,14 @@ mod builtins {
     ///
     /// This is useful for debugging as it better shows what's inside an object.
     #[cfg_attr(docsrs, doc(cfg(feature = "builtins")))]
-    pub fn pprint(value: &Value) -> String {
-        format!("{value:#?}")
+    pub fn pprint(state: &State, value: &Value) -> Result<String, Error> {
+        // `Debug` output has no size that can be computed in advance -- it walks
+        // whatever the value contains, including a lazily repeated sequence --
+        // so it is written through a sink that checks the budget as it grows.
+        let check = state.alloc_checker();
+        let mut writer = BudgetWriter::new(&check);
+        let rv = write!(writer, "{value:#?}");
+        writer.finish(rv)
     }
 
     /// Apply the given values to a [printf-style] format string.
@@ -1846,6 +1930,7 @@ mod builtins {
         let string = format_str
             .as_str()
             .ok_or_else(|| Error::new(ErrorKind::InvalidOperation, "value is not a string"))?;
+        let check = state.alloc_checker();
         if format_str.is_safe() {
             let output = ok!(format_printf_with(
                 string,
@@ -1869,10 +1954,12 @@ mod builtins {
                         escape(state, value).map(|value| Some(Value::from(value.as_str().unwrap())))
                     }
                 },
+                &check,
             ));
             Ok(Value::from_safe_string(output))
         } else {
-            format_filter(FormatStyle::Printf, string, &format_args).map(Value::from)
+            format_filter_checked(FormatStyle::Printf, string, &format_args, &check)
+                .map(Value::from)
         }
     }
 }

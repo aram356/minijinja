@@ -2,6 +2,7 @@ use std::fmt::{Display, LowerExp};
 use std::num::FpCategory;
 
 use crate::value::ValueKind;
+use crate::vm::alloc::SizeCheck;
 use crate::{Error, ErrorKind, Value};
 
 /// Controls the style of the format string.
@@ -39,9 +40,25 @@ pub fn format_filter(
     format_str: &str,
     args: &[Value],
 ) -> Result<String, Error> {
+    format_filter_checked(style, format_str, args, &|_| Ok(()))
+}
+
+/// [`format_filter`] with a budget check applied to the output it builds.
+///
+/// A format spec's width is an unbounded integer that is materialized as
+/// padding, so `"%2000000000s"|format('x')` asks for a 2 GB allocation from a
+/// twelve-byte format string.  `check` is consulted for each field's width
+/// before that field is padded, and for the accumulated result after it, so an
+/// oversized format fails instead of allocating.
+pub(crate) fn format_filter_checked(
+    style: FormatStyle,
+    format_str: &str,
+    args: &[Value],
+    check: SizeCheck<'_>,
+) -> Result<String, Error> {
     match style {
-        FormatStyle::Printf => printf_style::format(format_str, args),
-        FormatStyle::StrFormat => str_format_style::format(format_str, args),
+        FormatStyle::Printf => printf_style::format(format_str, args, check),
+        FormatStyle::StrFormat => str_format_style::format(format_str, args, check),
     }
 }
 
@@ -49,8 +66,9 @@ pub(crate) fn format_printf_with(
     format_str: &str,
     args: &[Value],
     transform: impl Fn(&Value, FormatConversion) -> Result<Option<Value>, Error>,
+    check: SizeCheck<'_>,
 ) -> Result<String, Error> {
-    printf_style::format_with(format_str, args, &transform)
+    printf_style::format_with(format_str, args, &transform, check)
 }
 
 // Token produced by the format string parser
@@ -1142,14 +1160,19 @@ mod printf_style {
     // Do printf-style formatting. Parse the format string and apply values from args
     // to the fields found in the string, by formatting the value according to the
     // spec found in the field.
-    pub(super) fn format(format_str: &str, args: &[Value]) -> Result<String, Error> {
-        format_with(format_str, args, &|_, _| Ok(None))
+    pub(super) fn format(
+        format_str: &str,
+        args: &[Value],
+        check: SizeCheck<'_>,
+    ) -> Result<String, Error> {
+        format_with(format_str, args, &|_, _| Ok(None), check)
     }
 
     pub(super) fn format_with(
         format_str: &str,
         args: &[Value],
         transform: &impl Fn(&Value, FormatConversion) -> Result<Option<Value>, Error>,
+        check: SizeCheck<'_>,
     ) -> Result<String, Error> {
         let mut input = Tokenizer::new(format_str, FormatStyle::Printf);
         let mut result = String::new();
@@ -1205,9 +1228,11 @@ mod printf_style {
                         FormatConversion::Other
                     };
                     let transformed = ok!(transform(&arg, conversion));
+                    ok!(check(format_spec.width.unwrap_or(0)));
                     result.push_str(&ok!(
                         format_spec.format(transformed.as_ref().unwrap_or(&arg))
                     ));
+                    ok!(check(result.len()));
                 }
             }
         }
@@ -1515,7 +1540,11 @@ mod str_format_style {
     // Do str.format style formatting. Parse the format string and apply values from
     // args to the fields found in the string, by formatting the value according to
     // the spec found in the field.
-    pub(super) fn format(format_str: &str, args: &[Value]) -> Result<String, Error> {
+    pub(super) fn format(
+        format_str: &str,
+        args: &[Value],
+        check: SizeCheck<'_>,
+    ) -> Result<String, Error> {
         let mut input = Tokenizer::new(format_str, FormatStyle::StrFormat);
         let mut result = String::new();
 
@@ -1596,7 +1625,9 @@ mod str_format_style {
 
                     // apply the spec to the replacement value, and insert the
                     // formatted result into final string
+                    ok!(check(format_spec.width.unwrap_or(0)));
                     result.push_str(&ok!(format_spec.format(&arg)));
+                    ok!(check(result.len()));
                 }
             }
         }

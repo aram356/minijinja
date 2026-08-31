@@ -26,7 +26,7 @@ use crate::vm::closure_object::Closure;
 pub(crate) use crate::vm::context::Context;
 pub use crate::vm::state::State;
 
-mod alloc;
+pub(crate) mod alloc;
 #[cfg(feature = "macros")]
 mod closure_object;
 mod context;
@@ -39,7 +39,7 @@ mod macro_object;
 mod module_object;
 mod state;
 
-use self::alloc::AllocTracker;
+use self::alloc::{AllocTracker, CONTAINER_ELEMENT_COST};
 
 // the cost of a single include against the stack limit.
 #[cfg(feature = "multi_template")]
@@ -319,13 +319,63 @@ impl<'env> Vm<'env> {
 
             // Charges the per-render allocation budget for a value about to be
             // pushed onto the stack, if it is a newly-constructed string.  Used
-            // by every arm that can produce a string (operators, filters,
-            // function/method/object calls, and captures) so the budget is a
-            // complete bound on evaluation-produced intermediate strings.
+            // by the arms whose result is a plain string: the operators, string
+            // slicing, and the captures.
+            //
+            // This is accounting, not a bound: it runs after the operation has
+            // already allocated.  What bounds a single operation is the
+            // pre-allocation check the growth sites perform for themselves
+            // through `State::alloc_check` before they allocate.
             macro_rules! charge_str {
                 ($rv:expr) => {{
                     if let Some(ref tracker) = state.alloc_tracker {
-                        ctx_ok!(charge_alloc(tracker, &$rv));
+                        ctx_ok!(charge_str_result(tracker, &$rv));
+                    }
+                }};
+            }
+
+            // Charges a value produced by a filter or by host code (a function,
+            // method, or object call), walking into a container it returned.
+            // Such code is opaque -- it can hand back an owned `Vec<String>` it
+            // just built, which charges nothing at all if only the top level is
+            // inspected -- so the result is accounted by content rather than by
+            // shape.  The walk is bounded (see `charge_value_deep`).
+            macro_rules! charge_deep {
+                ($rv:expr) => {{
+                    if let Some(ref tracker) = state.alloc_tracker {
+                        ctx_ok!(charge_value_deep(tracker, &$rv));
+                    }
+                }};
+            }
+
+            // Checks the size a string-producing operator is about to build.
+            // `MAX_REPEATED_STRING_LEN` already rejects an absurd one, but its
+            // ceiling is fixed and unrelated to the budget, so a single `+`, `~`
+            // or `*` could still build far more than the budget allows before
+            // the result was charged.
+            macro_rules! check_str_op {
+                ($len:expr) => {{
+                    if let Some(ref tracker) = state.alloc_tracker {
+                        if let Some(len) = $len {
+                            ctx_ok!(tracker.check(len));
+                        }
+                    }
+                }};
+            }
+
+            // Bounds an in-memory buffer that output is accumulating into (a
+            // `{% set %}` capture, a `{% filter %}` block, or a macro body).
+            // Those never reach the caller's writer, so a bounded output sink
+            // cannot see them, and charging the finished string only reports a
+            // buffer that has already been built.  Checking the buffer's size
+            // after each emit bounds it while it grows; the overshoot is one
+            // emit, which was itself already charged when it was produced.
+            macro_rules! check_buffered {
+                () => {{
+                    if let Some(ref tracker) = state.alloc_tracker {
+                        if let Some(len) = out.buffered_len() {
+                            ctx_ok!(tracker.check(len));
+                        }
                     }
                 }};
             }
@@ -348,6 +398,7 @@ impl<'env> Vm<'env> {
                     // this only produces a format error, no need to attach
                     // location information.
                     ok!(out.write_str(val).map_err(Error::from));
+                    check_buffered!();
                 }
                 Instruction::Emit => {
                     let value = stack.pop();
@@ -361,6 +412,7 @@ impl<'env> Vm<'env> {
                     } else {
                         ctx_ok!(self.env.format(&value, state, out));
                     }
+                    check_buffered!();
                 }
                 Instruction::StoreLocal(name) => {
                     state.ctx.store(name, stack.pop());
@@ -410,7 +462,9 @@ impl<'env> Vm<'env> {
                     if a.is_undefined() && matches!(undefined_behavior, UndefinedBehavior::Strict) {
                         bail!(Error::from(ErrorKind::UndefinedError));
                     }
-                    stack.push(ctx_ok!(ops::slice(a, b, stop, step)));
+                    let rv = ctx_ok!(ops::slice(a, b, stop, step));
+                    charge_str!(rv);
+                    stack.push(rv);
                 }
                 Instruction::LoadConst(value) => {
                     stack.push(value.clone());
@@ -466,6 +520,7 @@ impl<'env> Vm<'env> {
                 Instruction::Add => {
                     b = stack.pop();
                     a = stack.pop();
+                    check_str_op!(str_concat_len(&a, &b));
                     let rv = ctx_ok!(ops::add(&a, &b));
                     charge_str!(rv);
                     stack.push(rv);
@@ -474,6 +529,7 @@ impl<'env> Vm<'env> {
                 Instruction::Mul => {
                     b = stack.pop();
                     a = stack.pop();
+                    check_str_op!(str_repeat_len(&a, &b));
                     let rv = ctx_ok!(ops::mul(&a, &b));
                     charge_str!(rv);
                     stack.push(rv);
@@ -497,6 +553,7 @@ impl<'env> Vm<'env> {
                     b = stack.pop();
                     ctx_ok!(undefined_behavior.assert_value_not_undefined(&b));
                     ctx_ok!(undefined_behavior.assert_value_not_undefined(&a));
+                    check_str_op!(str_concat_len(&b, &a));
                     let rv = ctx_ok!(ops::string_concat(b, &a));
                     charge_str!(rv);
                     stack.push(rv);
@@ -664,7 +721,7 @@ impl<'env> Vm<'env> {
                     let arg_count = args.len();
                     a = ctx_ok!(filter.call(state, args));
                     stack.drop_top(arg_count);
-                    charge_str!(a);
+                    charge_deep!(a);
                     stack.push(a);
                 }
                 Instruction::PerformTest(name, arg_count, local_id) => {
@@ -718,7 +775,7 @@ impl<'env> Vm<'env> {
                     };
                     let arg_count = args.len();
                     stack.drop_top(arg_count);
-                    charge_str!(rv);
+                    charge_deep!(rv);
                     stack.push(rv);
                 }
                 Instruction::CallMethod(name, arg_count) => {
@@ -726,7 +783,7 @@ impl<'env> Vm<'env> {
                     let arg_count = args.len();
                     a = ctx_ok!(args[0].call_method(state, name, &args[1..]));
                     stack.drop_top(arg_count);
-                    charge_str!(a);
+                    charge_deep!(a);
                     stack.push(a);
                 }
                 Instruction::CallObject(arg_count) => {
@@ -734,7 +791,7 @@ impl<'env> Vm<'env> {
                     let arg_count = args.len();
                     a = ctx_ok!(args[0].call(state, &args[1..]));
                     stack.drop_top(arg_count);
-                    charge_str!(a);
+                    charge_deep!(a);
                     stack.push(a);
                 }
                 Instruction::DupTop => {
@@ -1176,14 +1233,109 @@ impl<'env> Vm<'env> {
     }
 }
 
-/// Charges the render's allocation budget for a string produced by an
-/// arithmetic instruction.  Only the string-producing operators (`+`, `*`) can
-/// grow intermediate allocations without bound, so non-string results are free.
-fn charge_alloc(tracker: &AllocTracker, rv: &Value) -> Result<(), Error> {
+/// The length a string concatenation (`+` or `~`) would produce, if it is one.
+///
+/// A non-string operand renders to a bounded length and contributes nothing
+/// here; the case worth bounding is two large strings being joined.
+fn str_concat_len(lhs: &Value, rhs: &Value) -> Option<usize> {
+    let lhs = lhs.as_str()?.len();
+    let rhs = rhs.as_str()?.len();
+    Some(lhs.saturating_add(rhs))
+}
+
+/// The length a string repeat (`*`) would produce, if it is one.
+fn str_repeat_len(lhs: &Value, rhs: &Value) -> Option<usize> {
+    let (s, n) = match (lhs.as_str(), rhs.as_str()) {
+        (Some(s), None) => (s, rhs),
+        (None, Some(s)) => (s, lhs),
+        _ => return None,
+    };
+    Some(s.len().saturating_mul(n.as_usize()?))
+}
+
+/// Charges the render's allocation budget for a plain string result.
+///
+/// Used by the arms whose result is either a string or a value that allocated
+/// nothing new (the operators and string slicing).
+fn charge_str_result(tracker: &AllocTracker, rv: &Value) -> Result<(), Error> {
     match rv.as_str().map(str::len) {
         Some(len) => tracker.charge(len),
         None => Ok(()),
     }
+}
+
+/// How deep into a returned container the accounting walk descends.
+const CHARGE_MAX_DEPTH: usize = 8;
+
+/// How many values the accounting walk visits before it stops descending.
+///
+/// Generous enough to cover a container built from a realistic input (splitting
+/// a 128 KiB string into single characters yields ~131k elements) while keeping
+/// the walk itself bounded.
+const CHARGE_MAX_VISITS: usize = 250_000;
+
+/// Charges the render's allocation budget for a value returned by a filter or
+/// by host code, accounting for the contents of a container it built.
+///
+/// Charging only `as_str()` reports zero for a sequence, so a filter or an
+/// unknown-method callback that returns an owned `Vec<String>` charged nothing
+/// at all and could be retained without limit.  Each visited element is charged
+/// its string bytes plus [`CONTAINER_ELEMENT_COST`], because a container of many
+/// tiny strings costs far more than the sum of their lengths.
+///
+/// The walk is bounded in both depth and breadth, and it never descends into a
+/// lazy iterable: forcing one to enumerate would do the very work the budget
+/// exists to prevent (and would consume a one-shot iterator).  A container that
+/// exceeds the visit budget is charged for what was seen; the sites that build
+/// large containers also check their own size before allocating.
+fn charge_value_deep(tracker: &AllocTracker, rv: &Value) -> Result<(), Error> {
+    if let Some(len) = rv.as_str().map(str::len) {
+        return tracker.charge(len);
+    }
+    let mut visits = 0usize;
+    charge_container(tracker, rv, 0, &mut visits)
+}
+
+fn charge_container(
+    tracker: &AllocTracker,
+    value: &Value,
+    depth: usize,
+    visits: &mut usize,
+) -> Result<(), Error> {
+    if depth >= CHARGE_MAX_DEPTH || *visits >= CHARGE_MAX_VISITS {
+        return Ok(());
+    }
+    // Only walk containers that already hold their elements.  A lazy iterable
+    // has not allocated them yet, and enumerating it here would both perform
+    // the work we are trying to bound and consume a one-shot iterator.
+    let Some(obj) = value.as_object() else {
+        return Ok(());
+    };
+    // A map is walked as pairs so its values are accounted too, not just its
+    // keys, which is what a plain iteration would yield.
+    let items: Box<dyn Iterator<Item = Value>> = match obj.repr() {
+        ObjectRepr::Map => match obj.try_iter_pairs() {
+            Some(pairs) => Box::new(pairs.flat_map(|(k, v)| [k, v])),
+            None => return Ok(()),
+        },
+        ObjectRepr::Seq => match obj.try_iter() {
+            Some(iter) => Box::new(iter),
+            None => return Ok(()),
+        },
+        _ => return Ok(()),
+    };
+    for item in items {
+        *visits += 1;
+        if *visits >= CHARGE_MAX_VISITS {
+            break;
+        }
+        ok!(tracker.charge(CONTAINER_ELEMENT_COST));
+        match item.as_str().map(str::len) {
+            Some(len) => ok!(tracker.charge(len)),
+            None => ok!(charge_container(tracker, &item, depth + 1, visits)),
+        }
+    }
+    Ok(())
 }
 
 #[inline(never)]

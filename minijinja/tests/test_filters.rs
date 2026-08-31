@@ -87,6 +87,7 @@ fn test_indent() {
     ] {
         let input = Value::from(input);
         let result = minijinja::filters::indent(
+            &state,
             StringInput::new(&state, &input).unwrap(),
             Some(2),
             first,

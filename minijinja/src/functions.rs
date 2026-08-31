@@ -245,6 +245,7 @@ tuple_impls! { A B }
 tuple_impls! { A B C }
 tuple_impls! { A B C D }
 tuple_impls! { A B C D E }
+tuple_impls! { A B C D E F }
 
 impl BoxedFunction {
     /// Creates a new boxed filter.

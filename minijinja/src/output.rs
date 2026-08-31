@@ -23,6 +23,9 @@ pub struct Output<'a> {
     w: *mut (dyn fmt::Write + 'a),
     target: *mut (dyn fmt::Write + 'a),
     capture_stack: Vec<Option<String>>,
+    /// Bytes written to the base target so far, tracked only when that target
+    /// is itself an in-memory buffer (see [`Output::new_buffered`]).
+    base_written: Option<usize>,
 }
 
 impl<'a> Output<'a> {
@@ -32,6 +35,26 @@ impl<'a> Output<'a> {
             w,
             target: w,
             capture_stack: Vec::new(),
+            base_written: None,
+        }
+    }
+
+    /// Creates a new output whose base target is an in-memory buffer.
+    ///
+    /// Rendering into a buffer -- a macro body, a block rendered to a string --
+    /// never reaches the caller's writer, so a bounded writer supplied by the
+    /// caller cannot see it grow.  Marking the base as buffered exposes the
+    /// accumulated size through [`buffered_len`](Self::buffered_len) so the
+    /// evaluator can bound it while it is being built.
+    // Only macro bodies render into a buffer today, so this is unused when
+    // macros are compiled out.
+    #[allow(dead_code)]
+    pub(crate) fn new_buffered(w: &'a mut (dyn fmt::Write + 'a)) -> Self {
+        Self {
+            w,
+            target: w,
+            capture_stack: Vec::new(),
+            base_written: Some(0),
         }
     }
 
@@ -44,6 +67,20 @@ impl<'a> Output<'a> {
             w: NullWriter::get_mut(),
             target: NullWriter::get_mut(),
             capture_stack: vec![None],
+            base_written: None,
+        }
+    }
+
+    /// Returns how many bytes the current write target holds, if that target is
+    /// an in-memory buffer.
+    ///
+    /// `None` means output is streaming to the caller's writer, or is being
+    /// discarded; in both cases there is no buffer here to bound.
+    pub(crate) fn buffered_len(&self) -> Option<usize> {
+        match self.capture_stack.last() {
+            Some(Some(buf)) => Some(buf.len()),
+            Some(None) => None,
+            None => self.base_written,
         }
     }
 
@@ -93,33 +130,45 @@ impl<'a> Output<'a> {
         matches!(self.capture_stack.last(), Some(None))
     }
 
+    /// Records bytes written straight to a buffered base target.
+    ///
+    /// Writes into a capture frame need no bookkeeping: the frame's `String` is
+    /// its own counter.  Only the base target is opaque, so its size is tracked
+    /// here.
+    #[inline(always)]
+    fn note_base_write(&mut self, len: usize) {
+        if self.capture_stack.is_empty() {
+            if let Some(ref mut written) = self.base_written {
+                *written = written.saturating_add(len);
+            }
+        }
+    }
+
     /// Writes some data to the underlying buffer contained within this output.
     #[inline]
     pub fn write_str(&mut self, s: &str) -> fmt::Result {
+        self.note_base_write(s.len());
         self.target().write_str(s)
     }
 
     /// Writes some formatted information into this instance.
     #[inline]
     pub fn write_fmt(&mut self, a: fmt::Arguments<'_>) -> fmt::Result {
-        self.target().write_fmt(a)
+        fmt::Write::write_fmt(self, a)
     }
 }
 
 impl fmt::Write for Output<'_> {
     #[inline]
     fn write_str(&mut self, s: &str) -> fmt::Result {
+        self.note_base_write(s.len());
         fmt::Write::write_str(self.target(), s)
     }
 
     #[inline]
     fn write_char(&mut self, c: char) -> fmt::Result {
+        self.note_base_write(c.len_utf8());
         fmt::Write::write_char(self.target(), c)
-    }
-
-    #[inline]
-    fn write_fmt(&mut self, args: fmt::Arguments<'_>) -> fmt::Result {
-        fmt::Write::write_fmt(self.target(), args)
     }
 }
 

@@ -238,16 +238,58 @@ impl Expr<'_> {
     }
 }
 
+/// Largest string a constant fold may materialize at compile time.
+///
+/// Folding runs in the parser, long before a render (and therefore before any
+/// allocation budget) exists, so a folded constant is memory the budget can
+/// never see: `{% set a = 'x' * 99999999 %}` bakes ~100 MB into the compiled
+/// template, and a 32 KB source packed with such expressions bakes gigabytes.
+/// Anything larger than this is left unfolded, so the operation runs at render
+/// time where it is checked and charged.  The value is generous next to any
+/// real constant while keeping compile-time memory proportional to the source.
+const MAX_FOLDED_STRING_LEN: usize = 64 * 1024;
+
+/// Rejects a fold whose result is too large to bake into the template.
+fn accept_fold(rv: Option<Value>) -> Option<Value> {
+    match rv {
+        Some(ref v) if v.as_str().is_some_and(|s| s.len() > MAX_FOLDED_STRING_LEN) => None,
+        other => other,
+    }
+}
+
+/// The size a string-producing fold would reach, if both sides are strings.
+///
+/// Checked before the fold runs so an oversized constant is never materialized
+/// only to be thrown away.
+fn folded_len_exceeds_cap(op: BinOpKind, left: &Value, right: &Value) -> bool {
+    let len = match op {
+        BinOpKind::Mul => match (left.as_str(), right.as_str()) {
+            (Some(s), None) => right.as_usize().map(|n| s.len().saturating_mul(n)),
+            (None, Some(s)) => left.as_usize().map(|n| s.len().saturating_mul(n)),
+            _ => None,
+        },
+        BinOpKind::Add | BinOpKind::Concat => match (left.as_str(), right.as_str()) {
+            (Some(a), Some(b)) => Some(a.len().saturating_add(b.len())),
+            _ => None,
+        },
+        _ => None,
+    };
+    len.is_some_and(|len| len > MAX_FOLDED_STRING_LEN)
+}
+
 fn eval_binop(op: BinOpKind, left: &Value, right: &Value) -> Option<Value> {
+    if folded_len_exceeds_cap(op, left, right) {
+        return None;
+    }
     match op {
-        BinOpKind::Add => ops::add(left, right).ok(),
+        BinOpKind::Add => accept_fold(ops::add(left, right).ok()),
         BinOpKind::Sub => ops::sub(left, right).ok(),
-        BinOpKind::Mul => ops::mul(left, right).ok(),
+        BinOpKind::Mul => accept_fold(ops::mul(left, right).ok()),
         BinOpKind::Div => ops::div(left, right).ok(),
         BinOpKind::FloorDiv => ops::int_div(left, right).ok(),
         BinOpKind::Rem => ops::rem(left, right).ok(),
         BinOpKind::Pow => ops::pow(left, right).ok(),
-        BinOpKind::Concat => ops::string_concat(left.clone(), right).ok(),
+        BinOpKind::Concat => accept_fold(ops::string_concat(left.clone(), right).ok()),
         BinOpKind::Eq => Some(Value::from(left == right)),
         BinOpKind::Ne => Some(Value::from(left != right)),
         BinOpKind::Lt => Some(Value::from(left < right)),

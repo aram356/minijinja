@@ -129,7 +129,10 @@ impl Object for Macro {
         ok!(vm.eval_macro(
             state,
             self.macro_ref_id,
-            &mut Output::new(&mut rv),
+            // The macro body renders into this buffer, never into the caller's
+            // writer, so mark it buffered: that is what lets the evaluator bound
+            // it while it grows instead of only charging the finished string.
+            &mut Output::new_buffered(&mut rv),
             self.closure.clone(),
             caller,
             arg_values
